@@ -25,8 +25,8 @@ auth:
       cookie:
         session: "session_account_b"
 
-# Max requests per second (0 = no limit)
-rate_limit: 5
+# Max requests per second (0 = no limit). Suggested: 10 (safe) / 50 (staging) / 100 (fast; may hit WAF)
+rate_limit: 10
 
 # Allowed domains (empty = target origin only)
 scope:

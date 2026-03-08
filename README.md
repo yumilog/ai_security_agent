@@ -79,8 +79,28 @@ Copy `config.yaml.example` to `config.yaml` and set:
 - **auth.jwt**: Token string → sent as `Authorization: Bearer <token>`
 - **auth.authorization**: Raw header value
 - **auth.user_switching**: List of `{ name, cookie? }` (two accounts) for broken access control testing
-- **rate_limit**: Max requests per second (e.g. `5`)
+- **rate_limit**: Max requests per second (e.g. `10`, `50`, `100`). Applied to vuln-test and other flows that use the shared HTTP client. `0` = no limit.
 - **scope**: Allowed domains
+
+**Approximate request volume (one full scan):**
+
+| Phase | Rough request count |
+|-------|---------------------|
+| Subdomain (CT) | 1 (crt.sh) |
+| Alive check | Dozens–hundreds (depends on subdomains/seeds) |
+| Crawl | Up to ~50 pages (MAX_PAGES_PER_DOMAIN) |
+| JS fetch | Number of discovered JS files |
+| Endpoint fuzzer | ~14 paths (wordlist) |
+| Vuln test | Dozens per endpoint (ID mutation, query/param wordlist, API-structure fuzz). Default cap ~20 endpoints → **hundreds** |
+| Header injection | ~30 (6 headers × 5 paths) |
+
+Total is typically **hundreds to ~1,000 requests**. Use `rate_limit` to cap requests per second and reduce load on the target/WAF.
+
+**Suggested rate_limit:**
+
+- **10 req/s**: Conservative; safe for most targets and bug bounties.
+- **50 req/s**: Good for internal/staging when you want faster scans.
+- **100 req/s**: Fast scans; may trigger strict WAF or rate limits.
 
 Example run:
 
