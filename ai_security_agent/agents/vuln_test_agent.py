@@ -1,6 +1,8 @@
 """Vulnerability test agent: safe parameter mutation and response collection (async)."""
 
 import asyncio
+import difflib
+import json
 import re
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
@@ -21,6 +23,7 @@ from ai_security_agent.config import (
 from ai_security_agent.llm.llm_client import analyze_with_llm
 from ai_security_agent.models.endpoint import Endpoint, EndpointMethod
 from ai_security_agent.models.scan_result import SuspiciousResponse, VulnCandidate
+from ai_security_agent.tools.api_structure import suggest_parameters_from_json
 from ai_security_agent.tools.http_client import request_with_headers_async
 from ai_security_agent.utils.logger import get_logger
 
@@ -28,6 +31,17 @@ logger = get_logger(__name__)
 
 INTERESTING_STATUS = {200, 201, 403, 404}
 BODY_PREVIEW_LEN = 1500
+
+# Headers to test for override / rewrite (header injection)
+HEADER_INJECTION_HEADERS = [
+    "X-Original-URL",
+    "X-Rewrite-URL",
+    "X-Forwarded-Host",
+    "X-Forwarded-For",
+    "X-Forwarded-Uri",
+    "X-Forwarded-Prefix",
+]
+HEADER_INJECTION_PATHS = ["/admin", "/internal", "/debug", "/api", "/graphql"]
 
 
 def _generate_id_variations(original_url: str, limit: int = MAX_VARIATIONS_PER_ENDPOINT) -> list[str]:
@@ -112,6 +126,29 @@ def _generate_wordlist_param_urls(original_url: str) -> list[str]:
     return result
 
 
+def _generate_api_suggested_param_urls(base_url: str, param_names: list[str]) -> list[str]:
+    """Build URLs with suggested param names (from JSON response keys) for parameter fuzzing."""
+    result: list[str] = []
+    parsed = urlparse(base_url)
+    base_path = parsed.path or "/"
+    existing = parse_qs(parsed.query, keep_blank_values=True) if parsed.query else {}
+    for param in param_names:
+        if not param or param in existing:
+            continue
+        new_params = {**existing, param: ["1"]}
+        new_query = urlencode(new_params, doseq=True)
+        new_url = urlunparse((
+            parsed.scheme,
+            parsed.netloc,
+            base_path,
+            parsed.params,
+            new_query,
+            parsed.fragment,
+        ))
+        result.append(new_url)
+    return result
+
+
 def _endpoint_pattern_for_similarity(url: str) -> str:
     """
     Normalize URL to a pattern for grouping (path + param names; values replaced).
@@ -131,34 +168,66 @@ def _endpoint_pattern_for_similarity(url: str) -> str:
     return path + "?" + "&".join(f"{k}=*" for k in keys)
 
 
+def _json_keys_set(body: str) -> set[str] | None:
+    """Extract top-level JSON keys if body is JSON, else None."""
+    try:
+        data = json.loads((body or "").strip())
+        if isinstance(data, dict):
+            return set(data.keys())
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return None
+
+
 def _detect_response_similarity(
     results: list[tuple[str, str, int, dict, dict, str]],
 ) -> list[VulnCandidate]:
     """
-    Group responses by endpoint pattern; if multiple 200 responses have similar
-    body length (same structure, different data), flag as IDOR candidate.
+    Group responses by endpoint pattern. Flag as IDOR candidate if multiple 200 responses:
+    - have similar content length, and/or
+    - have same JSON structure (same keys), and/or
+    - high difflib similarity ratio (same structure, different values).
     """
     candidates: list[VulnCandidate] = []
-    by_pattern: dict[str, list[tuple[str, str, int, int]]] = {}
+    by_pattern: dict[str, list[tuple[str, str, int, int, str]]] = {}
     for url, method, status, _req_h, _resp_h, body in results:
         if status != 200:
             continue
         pattern = _endpoint_pattern_for_similarity(url)
         length = len(body)
-        by_pattern.setdefault(pattern, []).append((url, method, status, length))
+        by_pattern.setdefault(pattern, []).append((url, method, status, length, body))
 
     for pattern, entries in by_pattern.items():
         if len(entries) < RESPONSE_SIMILARITY_MIN_COUNT:
             continue
         lengths = [e[3] for e in entries]
+        bodies = [e[4] for e in entries]
         min_len = min(lengths)
         max_len = max(lengths)
         if min_len == 0:
             continue
-        ratio = (max_len - min_len) / min_len
-        if ratio <= RESPONSE_SIMILARITY_TOLERANCE_RATIO:
+        length_ratio = (max_len - min_len) / min_len if min_len else 0
+        length_similar = length_ratio <= RESPONSE_SIMILARITY_TOLERANCE_RATIO
+
+        json_similar = False
+        key_sets = [_json_keys_set(b) for b in bodies]
+        if all(s is not None for s in key_sets) and key_sets:
+            first = key_sets[0]
+            json_similar = all(s == first for s in key_sets)
+
+        difflib_similar = False
+        if len(bodies) >= 2:
+            r = difflib.SequenceMatcher(None, bodies[0], bodies[1]).ratio()
+            difflib_similar = r >= 0.85
+
+        if length_similar or json_similar or difflib_similar:
             urls = [e[0] for e in entries]
             length_str = ", ".join(f"len={e[3]}" for e in entries)
+            evidence_parts = [f"Pattern: {pattern}. Response lengths: {length_str}"]
+            if json_similar:
+                evidence_parts.append("Same JSON structure (keys match).")
+            if difflib_similar:
+                evidence_parts.append("High difflib similarity (same structure, different data).")
             candidates.append(
                 VulnCandidate(
                     type="idor",
@@ -166,8 +235,8 @@ def _detect_response_similarity(
                     endpoint_url=urls[0],
                     method=entries[0][1],
                     description="Response similarity: same structure, different data (IDOR candidate). "
-                    "Multiple IDs returned similar response length.",
-                    evidence=f"Pattern: {pattern}. Response lengths: {length_str}",
+                    "Multiple IDs returned similar length/JSON structure/difflib ratio.",
+                    evidence=" ".join(evidence_parts),
                     extra={"pattern": pattern, "urls": urls, "lengths": lengths},
                 )
             )
@@ -190,6 +259,46 @@ async def _collect_response_async(
     except Exception as e:
         logger.warning("Request failed %s %s: %s", method, url, e)
         return 0, {}, {}, str(e)
+
+
+async def _run_header_injection_async(
+    client: httpx.AsyncClient,
+    base_url: str,
+) -> list[VulnCandidate]:
+    """
+    Send GET base_url with X-Original-URL, X-Rewrite-URL, etc. set to /admin, /internal, etc.
+    If response differs from baseline (e.g. 200 when baseline was 404), flag as header override candidate.
+    """
+    candidates: list[VulnCandidate] = []
+    try:
+        baseline = await client.get(base_url)
+        baseline_status = baseline.status_code
+        baseline_len = len(baseline.text or "")
+    except Exception as e:
+        logger.debug("Header injection baseline failed %s: %s", base_url, e)
+        return []
+
+    for header_name in HEADER_INJECTION_HEADERS:
+        for path in HEADER_INJECTION_PATHS:
+            try:
+                resp = await client.get(base_url, headers={header_name: path})
+                if resp.status_code in (200, 201, 302, 403) and (
+                    resp.status_code != baseline_status or abs(len(resp.text or "") - baseline_len) > 100
+                ):
+                    candidates.append(
+                        VulnCandidate(
+                            type="header_injection",
+                            severity="medium",
+                            endpoint_url=base_url,
+                            method="GET",
+                            description=f"Header override: {header_name}={path} returned {resp.status_code} (baseline {baseline_status}). Possible rewrite/forward bypass.",
+                            evidence=f"{header_name}: {path} -> {resp.status_code}",
+                            extra={"header": header_name, "path": path, "status": resp.status_code},
+                        )
+                    )
+            except Exception:
+                pass
+    return candidates
 
 
 async def _run_user_switching_async(
@@ -306,6 +415,8 @@ async def run_vuln_tests_async(
         return (url, method, status, req_h, resp_h, body)
 
     opts = get_http_client_options(None)
+    valid_results: list[tuple[str, str, int, dict, dict, str]] = []
+
     async with httpx.AsyncClient(
         follow_redirects=True,
         timeout=REQUEST_TIMEOUT_SECONDS,
@@ -317,35 +428,90 @@ async def run_vuln_tests_async(
             return_exceptions=True,
         )
 
-    valid_results: list[tuple[str, str, int, dict, dict, str]] = []
-    for r in results:
-        if isinstance(r, Exception):
-            logger.warning("Vuln test task failed: %s", r)
-            continue
-        url, method, status, req_h, resp_h, body = r
-        valid_results.append((url, method, status, req_h, resp_h, body))
-        if status in INTERESTING_STATUS:
-            reason = f"Status {status} on API-like endpoint"
-            suspicious.append(
-                SuspiciousResponse(
-                    url=url,
-                    method=method,
-                    status_code=status,
-                    reason=reason,
-                    request_headers=req_h,
-                    response_headers=resp_h,
-                    response_body_preview=body[:2000],
+        for r in results:
+            if isinstance(r, Exception):
+                logger.warning("Vuln test task failed: %s", r)
+                continue
+            url, method, status, req_h, resp_h, body = r
+            valid_results.append((url, method, status, req_h, resp_h, body))
+            if status in INTERESTING_STATUS:
+                reason = f"Status {status} on API-like endpoint"
+                suspicious.append(
+                    SuspiciousResponse(
+                        url=url,
+                        method=method,
+                        status_code=status,
+                        reason=reason,
+                        request_headers=req_h,
+                        response_headers=resp_h,
+                        response_body_preview=body[:2000],
+                    )
                 )
+                if use_llm:
+                    for v in analyze_with_llm(method, url, status, req_h, resp_h, body):
+                        vuln_candidates.append(v)
+
+        # 3b) API structure: from 200 JSON responses, suggest param names and re-request
+        api_tasks: list[tuple[str, str]] = []
+        for url, method, status, _req_h, _resp_h, body in valid_results:
+            if status != 200 or not (body or "").strip().startswith("{"):
+                continue
+            suggested = suggest_parameters_from_json(body)
+            if not suggested:
+                continue
+            parsed_url = urlparse(url)
+            base_url_no_query = urlunparse((parsed_url.scheme, parsed_url.netloc, parsed_url.path or "/", "", "", ""))
+            for extra_url in _generate_api_suggested_param_urls(base_url_no_query, suggested):
+                if extra_url not in seen_urls:
+                    seen_urls.add(extra_url)
+                    api_tasks.append((extra_url, method))
+        if api_tasks:
+            logger.info("API structure param fuzz: %d extra requests", len(api_tasks))
+            results2 = await asyncio.gather(
+                *[do_one(client, u, m) for u, m in api_tasks],
+                return_exceptions=True,
             )
-            if use_llm:
-                for v in analyze_with_llm(method, url, status, req_h, resp_h, body):
-                    vuln_candidates.append(v)
+            for r in results2:
+                if isinstance(r, Exception):
+                    continue
+                url, method, status, req_h, resp_h, body = r
+                valid_results.append((url, method, status, req_h, resp_h, body))
+                if status in INTERESTING_STATUS:
+                    reason = "Status %s (API-suggested param)" % status
+                    suspicious.append(
+                        SuspiciousResponse(
+                            url=url,
+                            method=method,
+                            status_code=status,
+                            reason=reason,
+                            request_headers=req_h,
+                            response_headers=resp_h,
+                            response_body_preview=body[:2000],
+                        )
+                    )
+                    if use_llm:
+                        for v in analyze_with_llm(method, url, status, req_h, resp_h, body):
+                            vuln_candidates.append(v)
 
     # 4) Response similarity: same structure, different data -> IDOR candidate
     similarity_candidates = _detect_response_similarity(valid_results)
     vuln_candidates.extend(similarity_candidates)
 
-    # 5) User switching: A vs B same URL -> different response = broken access control candidate
+    # 5) Header injection: X-Original-URL, X-Rewrite-URL, etc.
+    parsed_base = urlparse(target_base_url)
+    base_origin = f"{parsed_base.scheme}://{parsed_base.netloc}/"
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+        headers=get_http_client_options(None)["headers"],
+        cookies=get_http_client_options(None).get("cookies"),
+    ) as header_client:
+        header_candidates = await _run_header_injection_async(header_client, base_origin)
+    vuln_candidates.extend(header_candidates)
+    if header_candidates:
+        logger.info("Header injection: %d candidates", len(header_candidates))
+
+    # 6) User switching: A vs B same URL -> different response = broken access control candidate
     switch_candidates: list[VulnCandidate] = []
     if len(AUTH_PROFILES) >= 2:
         async with httpx.AsyncClient(

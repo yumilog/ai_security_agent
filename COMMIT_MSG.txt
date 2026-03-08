@@ -1,0 +1,12 @@
+feat: add recon, endpoint/param fuzzing, and vuln detection upgrades
+
+- Subdomain discovery (tools/subdomain_discovery.py): CT logs + wordlist, eTLD+1 scope, dedup
+- Alive check (tools/alive_check.py): async httpx HEAD/GET, accept 200/301/302/403
+- Endpoint fuzzer (tools/endpoint_fuzzer.py): wordlist paths (/admin, /internal, etc.)
+- Parameter fuzzer (tools/parameter_fuzzer.py): common ID-like params on endpoints
+- API structure (tools/api_structure.py): extract JSON keys, suggest params for fuzzer
+- Vuln test: response similarity (length + JSON keys + difflib), header injection (X-Original-URL, etc.), API-suggested param fuzz
+- Auth: config support for auth.header.Authorization (Bearer token)
+- Recon pipeline: subdomain discovery → alive check → crawl
+- Manager: integrate endpoint fuzzer; pipeline order target → recon → endpoint+param discovery → vuln test → LLM → report
+- Config: ENDPOINT_FUZZ_ENABLED; config.yaml.example auth header example

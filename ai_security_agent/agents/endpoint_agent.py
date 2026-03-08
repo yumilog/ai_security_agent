@@ -84,10 +84,11 @@ def run_endpoint_discovery(
     page_urls: list[str],
     js_contents: list[tuple[str, str]],
     base_url: str,
+    extra_endpoints: list[tuple[str, int]] | None = None,
 ) -> list[Endpoint]:
     """
-    Combine crawl URLs and JS-derived URLs into a deduplicated endpoint list.
-    js_contents: list of (js_url, content).
+    Combine crawl URLs, JS-derived URLs, and optional endpoint_fuzzer results into a deduplicated list.
+    js_contents: list of (js_url, content). extra_endpoints: list of (url, status) from endpoint_fuzzer.
     """
     logger.info("Endpoint discovery: %d pages, %d JS files", len(page_urls), len(js_contents))
     all_endpoints: dict[tuple[str, str], Endpoint] = {}
@@ -101,6 +102,14 @@ def run_endpoint_discovery(
             key = (ep.url, ep.method.value)
             if key not in all_endpoints:
                 all_endpoints[key] = ep
+
+    if extra_endpoints:
+        for url, _status in extra_endpoints:
+            ep = Endpoint(url=url, method=EndpointMethod.GET, source="endpoint_fuzz", path_pattern=None)
+            key = (ep.url, ep.method.value)
+            if key not in all_endpoints:
+                all_endpoints[key] = ep
+        logger.info("Added %d endpoints from endpoint fuzzer", len(extra_endpoints))
 
     result = list(all_endpoints.values())
     logger.info("Discovered %d unique endpoints", len(result))

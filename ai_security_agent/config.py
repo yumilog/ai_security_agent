@@ -63,6 +63,9 @@ CT_LOOKUP_ENABLED = os.getenv("CT_LOOKUP_ENABLED", "true").lower() in ("true", "
 CT_CRTSH_TIMEOUT = float(os.getenv("CT_CRTSH_TIMEOUT", "30"))
 CT_MAX_SUBDOMAINS = int(os.getenv("CT_MAX_SUBDOMAINS", "100"))  # cap seeds to avoid huge crawl
 
+# Endpoint fuzzer: probe /admin, /internal, etc. (can disable via config)
+ENDPOINT_FUZZ_ENABLED = os.getenv("ENDPOINT_FUZZ_ENABLED", "true").lower() in ("true", "1", "yes")
+
 # --- Auth & session (from config.yaml or env) ---
 # Default auth: applied to all requests when no profile specified
 AUTH_COOKIES: dict[str, str] = {}
@@ -84,12 +87,15 @@ CONFIG_PATH: Path | None = None
 
 
 def _parse_auth_from_dict(auth: dict[str, Any]) -> tuple[dict[str, str], str | None, str | None]:
-    """Extract (cookies, jwt, authorization) from auth dict."""
+    """Extract (cookies, jwt, authorization) from auth dict. Supports auth.header.Authorization."""
     cookies: dict[str, str] = {}
     if "cookie" in auth and isinstance(auth["cookie"], dict):
         cookies = {k: str(v) for k, v in auth["cookie"].items()}
     jwt_val = auth.get("jwt") and str(auth["jwt"]).strip() or None
     auth_header = auth.get("authorization") and str(auth["authorization"]).strip() or None
+    if not auth_header and "header" in auth and isinstance(auth["header"], dict):
+        auth_header = auth["header"].get("Authorization") or auth["header"].get("authorization")
+        auth_header = auth_header and str(auth_header).strip() or None
     return cookies, jwt_val, auth_header
 
 

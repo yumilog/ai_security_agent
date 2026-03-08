@@ -1,4 +1,4 @@
-"""Recon agent: crawl site, collect links and JS URLs (async)."""
+"""Recon agent: subdomain discovery -> alive check -> crawl (async)."""
 
 import asyncio
 from urllib.parse import urlparse
@@ -11,32 +11,51 @@ from ai_security_agent.config import (
     get_http_client_options,
     REQUEST_TIMEOUT_SECONDS,
 )
+from ai_security_agent.tools.alive_check import filter_live_urls_async
 from ai_security_agent.tools.crawler import _get_registered_domain, crawl_site_async
-from ai_security_agent.tools.ct_logs import fetch_subdomains_from_ct_async
+from ai_security_agent.tools.subdomain_discovery import discover_subdomains_async
 from ai_security_agent.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# Run subdomain discovery + alive check before crawl (set False to use only target URL)
+SUBDOMAIN_ALIVE_PIPELINE = True
+
 
 async def run_recon_async(target_url: str) -> tuple[list[str], list[str]]:
     """
-    Crawl target website and collect page URLs and JavaScript file URLs.
-    If CT_LOOKUP_ENABLED, fetches subdomains from Certificate Transparency logs (crt.sh)
-    and adds them as extra seed URLs so they are crawled too.
+    Pipeline: subdomain discovery -> alive check -> crawl.
+    Discover subdomains (CT + wordlist), filter to live hosts, then crawl target + live URLs.
     Returns (page_urls, js_urls).
     """
     logger.info("Recon started for %s", target_url)
     extra_seed_urls: list[str] = []
-    if CT_LOOKUP_ENABLED:
-        registered_domain = _get_registered_domain(target_url)
-        if registered_domain:
-            subdomains = await fetch_subdomains_from_ct_async(registered_domain)
-            parsed = urlparse(target_url)
-            scheme = parsed.scheme or "https"
-            for host in subdomains:
-                extra_seed_urls.append(f"{scheme}://{host}/")
+
+    if SUBDOMAIN_ALIVE_PIPELINE:
+        subdomains = await discover_subdomains_async(
+            target_url,
+            use_ct=CT_LOOKUP_ENABLED,
+            use_wordlist=True,
+        )
+        parsed = urlparse(target_url)
+        scheme = parsed.scheme or "https"
+        candidate_urls = [f"{scheme}://{h}/" for h in subdomains]
+        if candidate_urls:
+            live_urls = await filter_live_urls_async(candidate_urls)
+            extra_seed_urls = live_urls
             if extra_seed_urls:
-                logger.info("CT logs: added %d subdomains as crawl seeds", len(extra_seed_urls))
+                logger.info("Subdomain + alive: %d live URLs as crawl seeds", len(extra_seed_urls))
+    else:
+        # Legacy: only CT as extra seeds
+        if CT_LOOKUP_ENABLED:
+            rd = _get_registered_domain(target_url)
+            if rd:
+                from ai_security_agent.tools.ct_logs import fetch_subdomains_from_ct_async
+                hosts = await fetch_subdomains_from_ct_async(rd)
+                parsed = urlparse(target_url)
+                scheme = parsed.scheme or "https"
+                extra_seed_urls = [f"{scheme}://{h}/" for h in hosts]
+
     page_urls, js_urls = await crawl_site_async(target_url, extra_seed_urls=extra_seed_urls or None)
     logger.info("Recon finished: %d pages, %d JS files", len(page_urls), len(js_urls))
     return page_urls, js_urls

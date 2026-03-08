@@ -9,8 +9,11 @@ auth:
     session: "your-session-cookie-value"
   # Or use JWT (sent as Authorization: Bearer <token>)
   # jwt: "eyJ..."
-  # Or raw Authorization header
+  # Or raw Authorization header (Bearer token or custom)
   # authorization: "Bearer xxx"
+  # Or use header block for Authorization
+  # header:
+  #   Authorization: "Bearer YOUR_TOKEN"
 
   # User switching: two sessions (Account A, Account B) for broken access control testing
   # Same URL requested with A and B; if response differs -> candidate
