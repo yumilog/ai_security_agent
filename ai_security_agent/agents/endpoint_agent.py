@@ -9,9 +9,9 @@ from ai_security_agent.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# URL path patterns that suggest API endpoints
+# URL path patterns that suggest API endpoints (must match js_parser prefixes)
 API_PATH_RE = re.compile(
-    r"^/(api|v1|v2|v3|graphql|rest|user|users|order|orders|admin|auth)(/|$)",
+    r"^/(api|v1|v2|v3|graphql|rest|user|users|order|orders|admin|auth|internal)(/|$)",
     re.I,
 )
 ID_SEGMENT_RE = re.compile(r"/(\d+|[0-9a-f-]{36})", re.I)

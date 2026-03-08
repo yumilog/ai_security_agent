@@ -1,9 +1,10 @@
 """Safe website crawler: collect links and script URLs (async for speed)."""
 
 import asyncio
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import httpx
+import tldextract
 from bs4 import BeautifulSoup
 
 from ai_security_agent.config import (
@@ -22,6 +23,35 @@ def _crawl_headers() -> dict[str, str]:
     opts = get_http_client_options(None)
     base = {"Accept": "text/html,*/*;q=0.9"}
     return {**opts["headers"], **base}
+
+
+def _get_registered_domain(url: str) -> str:
+    """Return eTLD+1 (registrable domain) for url, e.g. example.com. Fallback to netloc for IP/localhost."""
+    try:
+        parsed = urlparse(url)
+        if not parsed.netloc:
+            return ""
+        ext = tldextract.extract(url)
+        rd = getattr(ext, "top_domain_under_public_suffix", None) or getattr(
+            ext, "registered_domain", None
+        )
+        if rd:
+            return rd.lower()
+        if ext.domain and ext.suffix:
+            return f"{ext.domain}.{ext.suffix}".lower()
+        return parsed.netloc.lower()
+    except Exception:
+        return urlparse(url).netloc.lower() or ""
+
+
+def _is_in_scope(url: str, target_registered_domain: str) -> bool:
+    """True if url belongs to the same registrable domain (eTLD+1) as target. Allows subdomains."""
+    if not target_registered_domain:
+        return True
+    url_domain = _get_registered_domain(url)
+    if not url_domain:
+        return False
+    return url_domain == target_registered_domain
 
 
 def _same_origin(base_url: str, link: str) -> bool:
@@ -44,26 +74,56 @@ def _normalize_url(url: str) -> str:
     return no_frag.rstrip("/") or no_frag
 
 
-def _extract_links(soup: BeautifulSoup, base_url: str) -> list[str]:
-    """Extract same-origin href links from page."""
+def normalize_url_for_crawl(url: str) -> str:
+    """
+    Normalize URL for crawl dedup: path + sorted param names (values ignored).
+    e.g. /product?id=1, /product?id=2, /product?id=3 -> same key /product?id
+    so we only crawl one representative URL per pattern (avoids 10000 URLs).
+    """
+    parsed = urlparse(url)
+    path = (parsed.path or "/").rstrip("/") or "/"
+    if not parsed.query:
+        return path
+    try:
+        params = parse_qs(parsed.query, keep_blank_values=True)
+        keys = sorted(params.keys())
+        if keys:
+            return path + "?" + "&".join(keys)
+    except Exception:
+        pass
+    return path
+
+
+def _extract_links(
+    soup: BeautifulSoup,
+    base_url: str,
+    target_registered_domain: str,
+) -> list[str]:
+    """Extract in-scope href links (same eTLD+1 as target; subdomains allowed)."""
     links: list[str] = []
     for tag in soup.find_all("a", href=True):
         href = tag["href"].strip()
         if not href or href.startswith(("#", "javascript:", "mailto:")):
             continue
         full = urljoin(base_url, href)
-        if _same_origin(base_url, full):
-            links.append(_normalize_url(full))
+        if not _is_in_scope(full, target_registered_domain):
+            continue
+        links.append(_normalize_url(full))
     return list(dict.fromkeys(links))
 
 
-def _extract_script_urls(soup: BeautifulSoup, base_url: str) -> list[str]:
-    """Extract same-origin script src URLs."""
+def _extract_script_urls(
+    soup: BeautifulSoup,
+    base_url: str,
+    target_registered_domain: str,
+) -> list[str]:
+    """Extract in-scope script src URLs (same eTLD+1 as target; subdomains allowed)."""
     urls: list[str] = []
     for tag in soup.find_all("script", src=True):
         full = urljoin(base_url, tag["src"])
-        if _same_origin(base_url, full):
-            urls.append(_normalize_url(full))
+        if not _is_in_scope(full, target_registered_domain):
+            continue
+        urls.append(_normalize_url(full))
     return list(dict.fromkeys(urls))
 
 
@@ -71,10 +131,11 @@ async def _fetch_page(
     client: httpx.AsyncClient,
     url: str,
     semaphore: asyncio.Semaphore,
+    target_registered_domain: str,
 ) -> tuple[str, str, list[str], list[str]]:
     """
     Fetch one page; return (url, html, links, js_urls).
-    On failure returns (url, "", [], []).
+    Links/script URLs are filtered by eTLD+1 scope. On failure returns (url, "", [], []).
     """
     async with semaphore:
         try:
@@ -83,8 +144,8 @@ async def _fetch_page(
             if "text/html" not in (resp.headers.get("content-type") or ""):
                 return (url, "", [], [])
             soup = BeautifulSoup(resp.text, "html.parser")
-            links = _extract_links(soup, url)
-            js_urls = _extract_script_urls(soup, url)
+            links = _extract_links(soup, url, target_registered_domain)
+            js_urls = _extract_script_urls(soup, url, target_registered_domain)
             logger.info("Crawled page %s (links=%d, js=%d)", url, len(links), len(js_urls))
             return (url, resp.text, links, js_urls)
         except Exception as e:
@@ -104,7 +165,12 @@ async def crawl_site_async(
     Returns (page_urls, js_urls). Same-origin only; concurrent per level.
     """
     start_url = _normalize_url(start_url)
-    seen_pages: set[str] = set()
+    target_registered_domain = _get_registered_domain(start_url)
+    if target_registered_domain:
+        logger.debug("Crawl scope (eTLD+1): %s (subdomains allowed)", target_registered_domain)
+
+    seen_normalized: set[str] = set()
+    seen_pages: list[str] = []
     all_js: set[str] = set()
     semaphore = asyncio.Semaphore(concurrency)
 
@@ -119,19 +185,28 @@ async def crawl_site_async(
         depth = 0
 
         while current_level and len(seen_pages) < max_pages and depth <= max_depth:
-            # Dedupe against already seen
-            to_fetch = [u for u in current_level if u not in seen_pages][: max_pages - len(seen_pages)]
+            to_fetch = []
+            for u in current_level:
+                if len(seen_pages) + len(to_fetch) >= max_pages:
+                    break
+                if not _is_in_scope(u, target_registered_domain):
+                    continue
+                norm = normalize_url_for_crawl(u)
+                if norm in seen_normalized:
+                    continue
+                seen_normalized.add(norm)
+                to_fetch.append(u)
             if not to_fetch:
                 break
             for u in to_fetch:
-                seen_pages.add(u)
+                seen_pages.append(u)
 
             results = await asyncio.gather(
-                *[_fetch_page(client, u, semaphore) for u in to_fetch],
+                *[_fetch_page(client, u, semaphore, target_registered_domain) for u in to_fetch],
                 return_exceptions=True,
             )
 
-            next_level: set[str] = set()
+            next_level = set()
             for r in results:
                 if isinstance(r, Exception):
                     logger.warning("Crawl task failed: %s", r)
@@ -140,13 +215,18 @@ async def crawl_site_async(
                 all_js.update(js_urls)
                 if depth < max_depth:
                     for link in links:
-                        if link not in seen_pages and _same_origin(start_url, link):
-                            next_level.add(link)
+                        if not _is_in_scope(link, target_registered_domain):
+                            continue
+                        norm = normalize_url_for_crawl(link)
+                        if norm in seen_normalized:
+                            continue
+                        seen_normalized.add(norm)
+                        next_level.add(link)
 
             current_level = next_level
             depth += 1
 
-    return list(seen_pages), list(all_js)
+    return seen_pages, list(all_js)
 
 
 def crawl_site(

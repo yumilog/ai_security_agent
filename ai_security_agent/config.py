@@ -33,7 +33,8 @@ MAX_QUERY_PARAM_VARIATIONS = 5
 # Query parameter mutation: try these values for ID-like params (e.g. ?id=1, ?id=124)
 QUERY_PARAM_MUTATION_VALUES = [1, 2, 124, 125, 126]
 
-# Parameter wordlist: append to endpoints for IDOR testing (e.g. /api/order?user_id=1)
+# Parameter discovery / parameter fuzzing: try these param names on endpoints (e.g. /api/order?user_id=1).
+# Many IDORs are found by appending common param names; used in vuln_test_agent.
 ID_PARAM_WORDLIST = [
     "user_id",
     "account_id",
@@ -42,6 +43,9 @@ ID_PARAM_WORDLIST = [
     "owner_id",
     "customer_id",
     "id",
+    "order_id",
+    "document_id",
+    "file_id",
 ]
 
 # Response similarity: treat as "same structure" if length diff within this ratio (0.15 = 15%)
