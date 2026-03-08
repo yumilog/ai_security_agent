@@ -1,19 +1,53 @@
-"""HTTP client for safe requests (async primary, sync kept for compatibility)."""
+"""HTTP client for safe requests; applies auth from config to every request."""
 
+import asyncio
+import time
 from typing import Any
 
 import httpx
 
-from ai_security_agent.config import DEFAULT_USER_AGENT, REQUEST_TIMEOUT_SECONDS
+from ai_security_agent.config import (
+    get_http_client_options,
+    RATE_LIMIT_REQ_PER_SEC,
+    REQUEST_TIMEOUT_SECONDS,
+)
 from ai_security_agent.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-DEFAULT_HEADERS = {
-    "User-Agent": DEFAULT_USER_AGENT,
-    "Accept": "text/html,application/json,application/xhtml+xml,*/*;q=0.9",
-    "Accept-Language": "en-US,en;q=0.9",
-}
+# All agents use get_http_client_options() so auth is applied after config is loaded (no import-time cache)
+
+# Rate limiter state (min interval between requests when RATE_LIMIT_REQ_PER_SEC > 0)
+_rate_limit_last: float = 0.0
+_rate_limit_lock = asyncio.Lock()
+
+
+async def _rate_limit_acquire() -> None:
+    if RATE_LIMIT_REQ_PER_SEC <= 0:
+        return
+    global _rate_limit_last
+    async with _rate_limit_lock:
+        now = time.monotonic()
+        interval = 1.0 / RATE_LIMIT_REQ_PER_SEC
+        elapsed = now - _rate_limit_last
+        if elapsed < interval:
+            await asyncio.sleep(interval - elapsed)
+        _rate_limit_last = time.monotonic()
+
+
+def _get_options(profile: Any = None) -> dict[str, Any]:
+    """Get current request options (headers + cookies) from config; optionally for a profile."""
+    return get_http_client_options(profile)
+
+
+def get_default_headers() -> dict[str, str]:
+    """Headers to use for all requests (includes auth from config)."""
+    return dict(get_http_client_options(None)["headers"])
+
+
+def get_default_cookies() -> dict[str, str]:
+    """Cookies to use for all requests (from config.auth.cookie)."""
+    return dict(get_http_client_options(None).get("cookies") or {})
 
 
 async def fetch_url_async(
@@ -22,8 +56,10 @@ async def fetch_url_async(
     method: str = "GET",
     headers: dict[str, str] | None = None,
 ) -> httpx.Response:
-    """Fetch a URL using the given async client."""
-    merged = {**DEFAULT_HEADERS, **(headers or {})}
+    """Fetch a URL using the given async client (client already has auth from config)."""
+    opts = _get_options(None)
+    merged = {**opts["headers"], **(headers or {})}
+    await _rate_limit_acquire()
     try:
         response = await client.request(method, url, headers=merged)
         logger.debug("Fetched %s %s -> %s", method, url, response.status_code)
@@ -39,9 +75,12 @@ async def request_with_headers_async(
     method: str = "GET",
     headers: dict[str, str] | None = None,
     params: dict[str, Any] | None = None,
+    profile: Any = None,
 ) -> tuple[httpx.Response, dict[str, str]]:
-    """Perform async request; return (response, request_headers_used)."""
-    merged = {**DEFAULT_HEADERS, **(headers or {})}
+    """Perform async request; return (response, request_headers_used). Uses config auth unless profile given."""
+    opts = _get_options(profile)
+    merged = {**opts["headers"], **(headers or {})}
+    await _rate_limit_acquire()
     try:
         response = await client.request(method, url, headers=merged, params=params)
         return response, dict(merged)
@@ -56,12 +95,14 @@ def fetch_url(
     headers: dict[str, str] | None = None,
     timeout: float = REQUEST_TIMEOUT_SECONDS,
 ) -> httpx.Response:
-    """Sync fetch (for backward compatibility or non-async callers)."""
-    merged = {**DEFAULT_HEADERS, **(headers or {})}
+    """Sync fetch (for backward compatibility). Applies config auth."""
+    opts = get_http_client_options(None)
+    merged = {**opts["headers"], **(headers or {})}
     with httpx.Client(
         follow_redirects=True,
         timeout=timeout,
         headers=merged,
+        cookies=opts.get("cookies"),
     ) as client:
         try:
             response = client.request(method, url)
@@ -79,12 +120,14 @@ def request_with_headers(
     params: dict[str, Any] | None = None,
     timeout: float = REQUEST_TIMEOUT_SECONDS,
 ) -> tuple[httpx.Response, dict[str, str]]:
-    """Sync request with headers (for backward compatibility)."""
-    merged = {**DEFAULT_HEADERS, **(headers or {})}
+    """Sync request with headers (for backward compatibility). Applies config auth."""
+    opts = get_http_client_options(None)
+    merged = {**opts["headers"], **(headers or {})}
     with httpx.Client(
         follow_redirects=True,
         timeout=timeout,
         headers=merged,
+        cookies=opts.get("cookies"),
     ) as client:
         try:
             response = client.request(method, url, params=params)

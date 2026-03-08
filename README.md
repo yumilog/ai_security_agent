@@ -13,6 +13,9 @@ Minimal **AI-assisted web security testing agent** for educational use and autho
 
 Concurrency limits (in `config.py`): `CRAWL_CONCURRENCY`, `FETCH_JS_CONCURRENCY`, `VULN_TEST_CONCURRENCY`.
 
+- **Session / auth**: Optional `config.yaml` to attach **cookie**, **JWT**, or **Authorization** header to every request. All agents (recon, endpoint discovery, vuln tests) use the same HTTP client, so auth is applied automatically.
+- **User switching**: If `config.yaml` defines two auth profiles under `auth.user_switching`, the scanner requests the same URL with Account A and Account B and compares responses; different status or body length is reported as a **broken access control** candidate.
+
 ## Requirements
 
 - Python 3.11+
@@ -38,9 +41,22 @@ python main.py --target https://example.com
 
 Options:
 
-- `--target URL` (required): Base URL to scan
+- `--target URL`: Base URL to scan (required unless set in `--config`)
+- `--config PATH`: Path to `config.yaml` (auth, rate_limit, scope, optional target)
 - `--no-llm`: Disable LLM analysis (crawl + endpoint + safe tests only)
 - `--report PATH`: Custom report path (default: `reports/scan_report.md`)
+
+### config.yaml (optional)
+
+Copy `config.yaml.example` to `config.yaml` and set:
+
+- **target**: Default scan target
+- **auth.cookie**: `{ name: value }` — sent on every request
+- **auth.jwt**: Token string → sent as `Authorization: Bearer <token>`
+- **auth.authorization**: Raw header value
+- **auth.user_switching**: List of `{ name, cookie? }` (two accounts) for broken access control testing
+- **rate_limit**: Max requests per second (e.g. `5`)
+- **scope**: Allowed domains
 
 Example run:
 

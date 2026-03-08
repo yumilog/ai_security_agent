@@ -7,6 +7,8 @@ from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 import httpx
 
 from ai_security_agent.config import (
+    AUTH_PROFILES,
+    get_http_client_options,
     ID_PARAM_WORDLIST,
     MAX_VARIATIONS_PER_ENDPOINT,
     MAX_QUERY_PARAM_VARIATIONS,
@@ -19,7 +21,7 @@ from ai_security_agent.config import (
 from ai_security_agent.llm.llm_client import analyze_with_llm
 from ai_security_agent.models.endpoint import Endpoint, EndpointMethod
 from ai_security_agent.models.scan_result import SuspiciousResponse, VulnCandidate
-from ai_security_agent.tools.http_client import DEFAULT_HEADERS, request_with_headers_async
+from ai_security_agent.tools.http_client import request_with_headers_async
 from ai_security_agent.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -177,16 +179,64 @@ async def _collect_response_async(
     client: httpx.AsyncClient,
     url: str,
     method: str,
+    profile: dict | None = None,
 ) -> tuple[int, dict[str, str], dict[str, str], str]:
-    """Perform async request; return (status, req_headers, resp_headers, body_preview)."""
+    """Perform async request; return (status, req_headers, resp_headers, body_preview). Optionally use auth profile."""
     try:
-        resp, req_headers = await request_with_headers_async(client, url, method)
+        resp, req_headers = await request_with_headers_async(client, url, method, profile=profile)
         resp_headers = dict(resp.headers)
         body = resp.text[:BODY_PREVIEW_LEN] if resp.text else ""
         return resp.status_code, req_headers, resp_headers, body
     except Exception as e:
         logger.warning("Request failed %s %s: %s", method, url, e)
         return 0, {}, {}, str(e)
+
+
+async def _run_user_switching_async(
+    client: httpx.AsyncClient,
+    tasks: list[tuple[str, str]],
+) -> list[VulnCandidate]:
+    """
+    Request same URL with Account A and Account B; if response differs (status or body length),
+    flag as broken access control candidate.
+    """
+    if len(AUTH_PROFILES) < 2:
+        return []
+    profile_a, profile_b = AUTH_PROFILES[0], AUTH_PROFILES[1]
+    name_a = profile_a.get("name", "A")
+    name_b = profile_b.get("name", "B")
+    candidates: list[VulnCandidate] = []
+    # Length diff ratio to consider "different" (e.g. 0.2 = 20%)
+    length_diff_ratio = 0.2
+
+    for url, method in tasks:
+        try:
+            status_a, _, _, body_a = await _collect_response_async(client, url, method, profile=profile_a)
+            status_b, _, _, body_b = await _collect_response_async(client, url, method, profile=profile_b)
+        except Exception as e:
+            logger.debug("User switching request failed %s: %s", url, e)
+            continue
+        len_a, len_b = len(body_a), len(body_b)
+        status_diff = status_a != status_b
+        if len_a and len_b:
+            length_ratio = abs(len_a - len_b) / max(len_a, len_b)
+            length_diff = length_ratio > length_diff_ratio
+        else:
+            length_diff = len_a != len_b
+        if status_diff or length_diff:
+            evidence = f"{name_a}: {status_a} (len={len_a}); {name_b}: {status_b} (len={len_b})"
+            candidates.append(
+                VulnCandidate(
+                    type="broken_access_control",
+                    severity="high",
+                    endpoint_url=url,
+                    method=method,
+                    description="User switching: different response for same URL (Account A vs B). Possible broken access control.",
+                    evidence=evidence,
+                    extra={"profile_a": name_a, "profile_b": name_b, "status_a": status_a, "status_b": status_b},
+                )
+            )
+    return candidates
 
 
 def _collect_response(url: str, method: str) -> tuple[int, dict[str, str], dict[str, str], str]:
@@ -255,10 +305,12 @@ async def run_vuln_tests_async(
             status, req_h, resp_h, body = await _collect_response_async(client, url, method)
         return (url, method, status, req_h, resp_h, body)
 
+    opts = get_http_client_options(None)
     async with httpx.AsyncClient(
         follow_redirects=True,
         timeout=REQUEST_TIMEOUT_SECONDS,
-        headers=DEFAULT_HEADERS,
+        headers=opts["headers"],
+        cookies=opts.get("cookies"),
     ) as client:
         results = await asyncio.gather(
             *[do_one(client, u, m) for u, m in tasks],
@@ -293,11 +345,28 @@ async def run_vuln_tests_async(
     similarity_candidates = _detect_response_similarity(valid_results)
     vuln_candidates.extend(similarity_candidates)
 
+    # 5) User switching: A vs B same URL -> different response = broken access control candidate
+    switch_candidates: list[VulnCandidate] = []
+    if len(AUTH_PROFILES) >= 2:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+            headers=get_http_client_options(None)["headers"],
+            cookies=get_http_client_options(None).get("cookies"),
+        ) as switch_client:
+            switch_candidates = await _run_user_switching_async(
+                switch_client,
+                [(ep.url, ep.method.value) for ep in endpoints[:max_endpoints]],
+            )
+        vuln_candidates.extend(switch_candidates)
+        logger.info("User switching: %d broken access control candidates", len(switch_candidates))
+
     logger.info(
-        "Vuln tests done: %d suspicious, %d LLM candidates, %d similarity IDOR candidates",
+        "Vuln tests done: %d suspicious, %d LLM candidates, %d similarity IDOR, %d user-switch candidates",
         len(suspicious),
-        len(vuln_candidates) - len(similarity_candidates),
+        len(vuln_candidates) - len(similarity_candidates) - len(switch_candidates),
         len(similarity_candidates),
+        len(switch_candidates),
     )
     return suspicious, vuln_candidates
 

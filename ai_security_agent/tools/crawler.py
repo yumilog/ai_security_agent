@@ -8,7 +8,7 @@ from bs4 import BeautifulSoup
 
 from ai_security_agent.config import (
     CRAWL_CONCURRENCY,
-    DEFAULT_USER_AGENT,
+    get_http_client_options,
     MAX_CRAWL_DEPTH,
     MAX_PAGES_PER_DOMAIN,
     REQUEST_TIMEOUT_SECONDS,
@@ -17,7 +17,11 @@ from ai_security_agent.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-DEFAULT_HEADERS = {"User-Agent": DEFAULT_USER_AGENT, "Accept": "text/html,*/*;q=0.9"}
+# Crawl uses same auth as rest of scanner (cookie / JWT / Authorization from config)
+def _crawl_headers() -> dict[str, str]:
+    opts = get_http_client_options(None)
+    base = {"Accept": "text/html,*/*;q=0.9"}
+    return {**opts["headers"], **base}
 
 
 def _same_origin(base_url: str, link: str) -> bool:
@@ -104,10 +108,12 @@ async def crawl_site_async(
     all_js: set[str] = set()
     semaphore = asyncio.Semaphore(concurrency)
 
+    opts = get_http_client_options(None)
     async with httpx.AsyncClient(
         follow_redirects=True,
         timeout=timeout,
-        headers=DEFAULT_HEADERS,
+        headers=_crawl_headers(),
+        cookies=opts.get("cookies"),
     ) as client:
         current_level: set[str] = {start_url}
         depth = 0

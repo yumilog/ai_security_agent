@@ -5,6 +5,7 @@ httpx>=0.25.0
 pydantic>=2.0.0
 python-dotenv>=1.0.0
 tldextract>=5.0.0
+PyYAML>=6.0.0
 
 # Optional: LLM (install at least one for analysis)
 openai>=1.0.0

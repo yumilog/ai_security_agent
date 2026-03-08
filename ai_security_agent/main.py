@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 from ai_security_agent.agents.manager_agent import run_scan_async
+from ai_security_agent.config import load_config_yaml
 from ai_security_agent.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -25,8 +26,13 @@ async def main_async() -> int:
     )
     parser.add_argument(
         "--target",
-        required=True,
-        help="Target URL to scan (e.g. https://example.com)",
+        default=None,
+        help="Target URL to scan (e.g. https://example.com). Can be set in config.yaml instead.",
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Path to config.yaml (auth, rate_limit, scope, optional target)",
     )
     parser.add_argument(
         "--no-llm",
@@ -40,7 +46,10 @@ async def main_async() -> int:
     )
     args = parser.parse_args()
 
-    target = args.target.strip()
+    config_data = load_config_yaml(args.config)
+    target = (args.target or "").strip() or (config_data.get("target") or "").strip()
+    if not target:
+        parser.error("--target URL is required (or set target in config.yaml and pass --config)")
     if not target.startswith(("http://", "https://")):
         target = "https://" + target
 

@@ -4,9 +4,8 @@ import asyncio
 
 import httpx
 
-from ai_security_agent.config import FETCH_JS_CONCURRENCY, REQUEST_TIMEOUT_SECONDS
+from ai_security_agent.config import FETCH_JS_CONCURRENCY, get_http_client_options, REQUEST_TIMEOUT_SECONDS
 from ai_security_agent.tools.crawler import crawl_site_async
-from ai_security_agent.tools.http_client import DEFAULT_HEADERS
 from ai_security_agent.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -41,12 +40,14 @@ async def fetch_all_js_async(
     """Fetch multiple JS URLs concurrently; returns list of (url, content)."""
     semaphore = asyncio.Semaphore(concurrency)
 
+    opts = get_http_client_options(None)
     async def fetch_one(url: str) -> tuple[str, str]:
         async with semaphore:
             async with httpx.AsyncClient(
                 follow_redirects=True,
                 timeout=REQUEST_TIMEOUT_SECONDS,
-                headers=DEFAULT_HEADERS,
+                headers=opts["headers"],
+                cookies=opts.get("cookies"),
             ) as client:
                 return await fetch_js_content_async(client, url)
 
@@ -69,11 +70,13 @@ def run_recon(target_url: str) -> tuple[list[str], list[str]]:
 
 def fetch_js_content(js_url: str) -> str:
     """Sync fetch single JS URL (for backward compatibility)."""
+    opts = get_http_client_options(None)
     async def _one() -> str:
         async with httpx.AsyncClient(
             follow_redirects=True,
             timeout=REQUEST_TIMEOUT_SECONDS,
-            headers=DEFAULT_HEADERS,
+            headers=opts["headers"],
+            cookies=opts.get("cookies"),
         ) as client:
             _, content = await fetch_js_content_async(client, js_url)
             return content

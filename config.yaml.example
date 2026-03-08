@@ -1,0 +1,30 @@
+# AI Security Agent config (optional)
+# Copy to config.yaml and fill in. All agents use config.auth for every request.
+
+target: https://example.com
+
+auth:
+  # Cookie: all requests send these cookies
+  cookie:
+    session: "your-session-cookie-value"
+  # Or use JWT (sent as Authorization: Bearer <token>)
+  # jwt: "eyJ..."
+  # Or raw Authorization header
+  # authorization: "Bearer xxx"
+
+  # User switching: two sessions (Account A, Account B) for broken access control testing
+  # Same URL requested with A and B; if response differs -> candidate
+  user_switching:
+    - name: "A"
+      cookie:
+        session: "session_account_a"
+    - name: "B"
+      cookie:
+        session: "session_account_b"
+
+# Max requests per second (0 = no limit)
+rate_limit: 5
+
+# Allowed domains (empty = target origin only)
+scope:
+  - example.com
