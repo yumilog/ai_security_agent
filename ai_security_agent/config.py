@@ -58,6 +58,11 @@ CRAWL_CONCURRENCY = 10
 FETCH_JS_CONCURRENCY = 15
 VULN_TEST_CONCURRENCY = 10
 
+# Certificate Transparency (crt.sh) for subdomain discovery
+CT_LOOKUP_ENABLED = os.getenv("CT_LOOKUP_ENABLED", "true").lower() in ("true", "1", "yes")
+CT_CRTSH_TIMEOUT = float(os.getenv("CT_CRTSH_TIMEOUT", "30"))
+CT_MAX_SUBDOMAINS = int(os.getenv("CT_MAX_SUBDOMAINS", "100"))  # cap seeds to avoid huge crawl
+
 # --- Auth & session (from config.yaml or env) ---
 # Default auth: applied to all requests when no profile specified
 AUTH_COOKIES: dict[str, str] = {}

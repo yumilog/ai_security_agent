@@ -6,15 +6,39 @@ Minimal **AI-assisted web security testing agent** for educational use and autho
 
 - **Async pipeline**: Crawling and HTTP tests use `asyncio` + `httpx.AsyncClient` for concurrent requests and faster scans.
 - **Recon**: Crawl target site (concurrent per depth level), collect links and JavaScript URLs (JS fetched in parallel).
-- **Endpoint discovery**: Detect API-like paths (`/api/*`, `/v1/*`, `/user/{id}`) from URLs and JS.
-- **Safe vuln tests**: Numeric ID variation, concurrent request testing; store responses for analysis.
+- **Endpoint discovery**: Detect API-like paths (`/api/*`, `/v1/*`, `/user/{id}`) from crawled URLs and from JavaScript (see below).
+- **Safe vuln tests**: Path ID variation, query param mutation, parameter fuzzing, response similarity, user switching; store responses for analysis.
 - **LLM analysis** (optional): Send request/response pairs to an LLM for IDOR, access control, sensitive data evaluation.
 - **Report**: Generate `scan_report.md` with target, endpoints, suspicious responses, and vulnerability candidates.
 
 Concurrency limits (in `config.py`): `CRAWL_CONCURRENCY`, `FETCH_JS_CONCURRENCY`, `VULN_TEST_CONCURRENCY`.
 
-- **Session / auth**: Optional `config.yaml` to attach **cookie**, **JWT**, or **Authorization** header to every request. All agents (recon, endpoint discovery, vuln tests) use the same HTTP client, so auth is applied automatically.
-- **User switching**: If `config.yaml` defines two auth profiles under `auth.user_switching`, the scanner requests the same URL with Account A and Account B and compares responses; different status or body length is reported as a **broken access control** candidate.
+### Crawler & scope
+
+- **URL normalization + dedup**: URLs are normalized by **path + query parameter names** (values ignored). e.g. `/product?id=1`, `/product?id=2`, `/product?id=3` are treated as one pattern and only one representative URL is crawled, avoiding explosion to thousands of URLs.
+- **eTLD+1 scope** (via `tldextract`): Only URLs whose **registrable domain** matches the target are allowed. Subdomains of the target are included; other domains are blocked.
+  - **Allowed** (target `https://example.com`): `example.com`, `api.example.com`, `cdn.example.com`, `mobile.example.com`, `admin.example.com`
+  - **Blocked**: `evil-example.com`, `google.com`
+- **Certificate Transparency (CT) logs**: Before crawling, the recon agent can query **crt.sh** for certificates issued for the target’s registrable domain and collect subdomain names from the logs. Those subdomains are added as **extra seed URLs** so they are included in the crawl (subject to eTLD+1 scope and the usual limits). Disable with `CT_LOOKUP_ENABLED=false`. Options: `CT_CRTSH_TIMEOUT`, `CT_MAX_SUBDOMAINS` (default 100).
+
+### JavaScript endpoint discovery
+
+- During crawl, all `<script src="...">` URLs are collected and each JavaScript file is **downloaded asynchronously** (concurrency limited by `FETCH_JS_CONCURRENCY`).
+- JS content is parsed with **regex** to extract API-like paths from strings and from `fetch` / `axios` calls.
+- **Detected patterns**: `/api/*`, `/v1/*`, `/v2/*`, `/user/*`, `/admin/*`, `/internal/*` (and `/v3`, `/graphql`, `/rest`, `/auth`, etc.).
+- Endpoints are **deduplicated** by URL and passed to the endpoint agent so `vuln_test_agent` can test them.
+
+### Vulnerability tests
+
+- **Path ID variation**: e.g. `/api/user/123` → test 124, 125, … (safe numeric mutation).
+- **Query parameter mutation**: e.g. `/api/user?id=123` → test `?id=124`, `?id=125`, `?id=1` (common IDOR vector).
+- **Parameter discovery / parameter fuzzing**: Append common param names to endpoints (e.g. `/api/order` → `?user_id=1`, `?account_id=1`, `?customer_id=1`). Wordlist in `config.ID_PARAM_WORDLIST`.
+- **Response similarity**: If multiple IDs return responses with similar body length (same structure, different data), flag as **IDOR candidate**.
+- **User switching**: If `config.yaml` defines two auth profiles under `auth.user_switching`, the same URL is requested as Account A and Account B; different status or body length is reported as **broken access control** candidate.
+
+### Session / auth
+
+- Optional `config.yaml` to attach **cookie**, **JWT**, or **Authorization** header to every request. All agents use the same HTTP client, so auth is applied automatically. **User switching** (two auth profiles) is described under Vulnerability tests above.
 
 ## Requirements
 
@@ -79,9 +103,10 @@ ai_security_agent/
     vuln_test_agent.py # Safe mutations, LLM analysis
     report_agent.py    # Build result, generate report
   tools/
-    crawler.py         # Same-origin crawler
-    http_client.py     # HTTP with safe defaults
-    js_parser.py       # Extract API calls from JS
+    crawler.py         # Crawler (eTLD+1 scope, URL normalization dedup, extra_seed_urls)
+    ct_logs.py         # Certificate Transparency (crt.sh) subdomain lookup
+    http_client.py     # HTTP client (auth from config)
+    js_parser.py       # Extract API endpoints from JS (regex)
   llm/
     llm_client.py      # OpenAI / Anthropic analysis
   models/

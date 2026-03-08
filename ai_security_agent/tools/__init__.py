@@ -1,6 +1,7 @@
 """Tools for crawling, HTTP, and JS parsing."""
 
 from ai_security_agent.tools.crawler import crawl_site, crawl_site_async, normalize_url_for_crawl
+from ai_security_agent.tools.ct_logs import fetch_subdomains_from_ct, fetch_subdomains_from_ct_async
 from ai_security_agent.tools.http_client import (
     fetch_url,
     fetch_url_async,
@@ -13,6 +14,8 @@ __all__ = [
     "crawl_site",
     "crawl_site_async",
     "normalize_url_for_crawl",
+    "fetch_subdomains_from_ct",
+    "fetch_subdomains_from_ct_async",
     "fetch_url",
     "fetch_url_async",
     "request_with_headers",

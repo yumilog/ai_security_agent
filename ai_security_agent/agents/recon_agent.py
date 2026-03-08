@@ -1,11 +1,18 @@
 """Recon agent: crawl site, collect links and JS URLs (async)."""
 
 import asyncio
+from urllib.parse import urlparse
 
 import httpx
 
-from ai_security_agent.config import FETCH_JS_CONCURRENCY, get_http_client_options, REQUEST_TIMEOUT_SECONDS
-from ai_security_agent.tools.crawler import crawl_site_async
+from ai_security_agent.config import (
+    CT_LOOKUP_ENABLED,
+    FETCH_JS_CONCURRENCY,
+    get_http_client_options,
+    REQUEST_TIMEOUT_SECONDS,
+)
+from ai_security_agent.tools.crawler import _get_registered_domain, crawl_site_async
+from ai_security_agent.tools.ct_logs import fetch_subdomains_from_ct_async
 from ai_security_agent.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -14,10 +21,23 @@ logger = get_logger(__name__)
 async def run_recon_async(target_url: str) -> tuple[list[str], list[str]]:
     """
     Crawl target website and collect page URLs and JavaScript file URLs.
+    If CT_LOOKUP_ENABLED, fetches subdomains from Certificate Transparency logs (crt.sh)
+    and adds them as extra seed URLs so they are crawled too.
     Returns (page_urls, js_urls).
     """
     logger.info("Recon started for %s", target_url)
-    page_urls, js_urls = await crawl_site_async(target_url)
+    extra_seed_urls: list[str] = []
+    if CT_LOOKUP_ENABLED:
+        registered_domain = _get_registered_domain(target_url)
+        if registered_domain:
+            subdomains = await fetch_subdomains_from_ct_async(registered_domain)
+            parsed = urlparse(target_url)
+            scheme = parsed.scheme or "https"
+            for host in subdomains:
+                extra_seed_urls.append(f"{scheme}://{host}/")
+            if extra_seed_urls:
+                logger.info("CT logs: added %d subdomains as crawl seeds", len(extra_seed_urls))
+    page_urls, js_urls = await crawl_site_async(target_url, extra_seed_urls=extra_seed_urls or None)
     logger.info("Recon finished: %d pages, %d JS files", len(page_urls), len(js_urls))
     return page_urls, js_urls
 

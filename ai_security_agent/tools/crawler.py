@@ -159,10 +159,12 @@ async def crawl_site_async(
     max_pages: int = MAX_PAGES_PER_DOMAIN,
     timeout: float = REQUEST_TIMEOUT_SECONDS,
     concurrency: int = CRAWL_CONCURRENCY,
+    extra_seed_urls: list[str] | None = None,
 ) -> tuple[list[str], list[str]]:
     """
     Crawl the site starting at start_url using async HTTP.
-    Returns (page_urls, js_urls). Same-origin only; concurrent per level.
+    If extra_seed_urls is set (e.g. from CT log subdomains), they are added to the initial crawl queue.
+    Returns (page_urls, js_urls). eTLD+1 scope; concurrent per level.
     """
     start_url = _normalize_url(start_url)
     target_registered_domain = _get_registered_domain(start_url)
@@ -174,6 +176,14 @@ async def crawl_site_async(
     all_js: set[str] = set()
     semaphore = asyncio.Semaphore(concurrency)
 
+    current_level: set[str] = {start_url}
+    if extra_seed_urls:
+        for u in extra_seed_urls:
+            u = _normalize_url(u)
+            if _is_in_scope(u, target_registered_domain):
+                current_level.add(u)
+        logger.info("Crawl seeds: %d URLs (target + %d extra)", len(current_level), len(extra_seed_urls))
+
     opts = get_http_client_options(None)
     async with httpx.AsyncClient(
         follow_redirects=True,
@@ -181,7 +191,6 @@ async def crawl_site_async(
         headers=_crawl_headers(),
         cookies=opts.get("cookies"),
     ) as client:
-        current_level: set[str] = {start_url}
         depth = 0
 
         while current_level and len(seen_pages) < max_pages and depth <= max_depth:
